@@ -61,6 +61,7 @@ for probe in newline-application newline-component newline-revision newline-sha 
         ;;
     esac
     export SNAPSHOT=$PR_CANDIDATE_TEST_CASE TASKRUN_NAMESPACE=default
+    export KUBECONFIG="$MOCK_STATE/kubeconfig"
     # Called indirectly by the inherited Snapshot API mock.
     # shellcheck disable=SC2329
     mock_snapshot() {
@@ -175,6 +176,17 @@ if [[ "$(yq '.spec.steps[0].timeout' "$TASK_PATH")" == 1h ]]; then
   printf 'PASS: fixed Tekton step timeout is 1h\n'
 else
   printf 'FAIL: fixed Tekton 1h execution backstop is missing\n'
+  failures=$((failures + 1))
+fi
+TASK_SCRIPT=$(yq -r '.spec.steps[0].script' "$TASK_PATH")
+if [[ "$(yq -r '.spec.steps[0].env[] | select(.name == "KUBECONFIG") | .value' "$TASK_PATH")" == \
+    /tekton/home/pr-candidate-kubeconfig &&
+  "$TASK_SCRIPT" == *'server: https://kubernetes.default.svc'* &&
+  "$TASK_SCRIPT" == *'certificate-authority: /var/run/secrets/kubernetes.io/serviceaccount/ca.crt'* &&
+  "$TASK_SCRIPT" == *'tokenFile: /var/run/secrets/kubernetes.io/serviceaccount/token'* ]]; then
+  printf 'PASS: explicit in-cluster kubeconfig uses projected credentials\n'
+else
+  printf 'FAIL: explicit in-cluster kubeconfig is missing\n'
   failures=$((failures + 1))
 fi
 printf 'Regression artifacts: %s\n' "$ARTIFACTS"

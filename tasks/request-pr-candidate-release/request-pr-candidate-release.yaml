@@ -42,9 +42,31 @@ spec:
           value: $(params.SNAPSHOT)
         - name: TASKRUN_NAMESPACE
           value: $(context.taskRun.namespace)
+        - name: KUBECONFIG
+          value: /tekton/home/pr-candidate-kubeconfig
       script: |
         #!/usr/bin/env bash
         set -euo pipefail
+
+        cat > "$KUBECONFIG" <<'EOF'
+        apiVersion: v1
+        kind: Config
+        clusters:
+          - name: in-cluster
+            cluster:
+              server: https://kubernetes.default.svc
+              certificate-authority: /var/run/secrets/kubernetes.io/serviceaccount/ca.crt
+        users:
+          - name: taskrun-service-account
+            user:
+              tokenFile: /var/run/secrets/kubernetes.io/serviceaccount/token
+        contexts:
+          - name: in-cluster
+            context:
+              cluster: in-cluster
+              user: taskrun-service-account
+        current-context: in-cluster
+        EOF
 
         fail() {
           printf '%s\n' "$*" >&2
