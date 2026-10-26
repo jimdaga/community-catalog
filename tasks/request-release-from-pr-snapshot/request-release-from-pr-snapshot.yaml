@@ -1,0 +1,131 @@
+---
+apiVersion: tekton.dev/v1
+kind: Task
+metadata:
+  name: request-release-from-pr-snapshot
+spec:
+  description: |-
+    Create a Release for a pull request Snapshot and wait for it to complete.
+
+    Intended to run as an IntegrationTestScenario so that pull request builds
+    can be published (for example to a development registry) by an existing
+    tenant ReleasePlan. The task itself holds no registry credentials; the
+    ReleasePlan's pipeline and service account do the publishing.
+
+    Guards:
+    - The Snapshot must come from a pull_request event
+    - The ReleasePlan must belong to the same application as the Snapshot
+    - The ReleasePlan must be labeled release.appstudio.openshift.io/auto-release: "false"
+      so that it cannot be a ReleasePlan used for regular releases
+
+    A Release already created for the same Snapshot UID and ReleasePlan is
+    reused, so re-running the test does not create duplicate Releases.
+    The task succeeds or fails based on the Release's Released condition.
+
+    The TaskRun service account needs get access to Snapshots and ReleasePlans
+    and create, get, and list access to Releases in the namespace
+  params:
+    - name: SNAPSHOT
+      type: string
+      description: Name of the pull request Snapshot in the TaskRun namespace
+    - name: RELEASE_PLAN
+      type: string
+      description: Name of the ReleasePlan in the TaskRun namespace to release the Snapshot with
+    - name: TIMEOUT_SECONDS
+      type: string
+      description: How long to wait for the Release to complete
+      default: "3600"
+  results:
+    - name: RELEASE_NAME
+      description: Name of the Release created or reused for the Snapshot
+  steps:
+    - name: request-release
+      image: quay.io/konflux-ci/release-service-utils:e633d51cd41d73e4b3310face21bb980af7a662f
+      env:
+        - name: SNAPSHOT
+          value: $(params.SNAPSHOT)
+        - name: RELEASE_PLAN
+          value: $(params.RELEASE_PLAN)
+        - name: TIMEOUT_SECONDS
+          value: $(params.TIMEOUT_SECONDS)
+        - name: NAMESPACE
+          value: $(context.taskRun.namespace)
+      script: |
+        #!/usr/bin/env bash
+        set -euo pipefail
+
+        SNAPSHOT_UID_LABEL="community-catalog.konflux-ci.dev/pr-snapshot-uid"
+        RELEASE_PLAN_LABEL="community-catalog.konflux-ci.dev/pr-release-plan"
+
+        fail() {
+          echo "ERROR: $*" >&2
+          exit 1
+        }
+
+        [[ "$TIMEOUT_SECONDS" =~ ^[0-9]+$ ]] || fail "TIMEOUT_SECONDS must be a whole number"
+        # The ReleasePlan name is stored as a label value, which is limited to 63 characters
+        [ "${#RELEASE_PLAN}" -le 63 ] || fail "RELEASE_PLAN name must be 63 characters or fewer"
+        DEADLINE=$(( $(date +%s) + TIMEOUT_SECONDS ))
+
+        SNAPSHOT_JSON=$(kubectl get snapshot "$SNAPSHOT" -n "$NAMESPACE" -o json)
+        EVENT_TYPE=$(jq -r '.metadata.labels["pac.test.appstudio.openshift.io/event-type"] // ""' \
+          <<< "$SNAPSHOT_JSON")
+        [ "$EVENT_TYPE" == "pull_request" ] ||
+          fail "Snapshot $SNAPSHOT is not from a pull_request event (event-type: '$EVENT_TYPE')"
+        APPLICATION=$(jq -r '.spec.application' <<< "$SNAPSHOT_JSON")
+        SNAPSHOT_UID=$(jq -r '.metadata.uid' <<< "$SNAPSHOT_JSON")
+
+        RELEASE_PLAN_JSON=$(kubectl get releaseplan "$RELEASE_PLAN" -n "$NAMESPACE" -o json)
+        PLAN_APPLICATION=$(jq -r '.spec.application' <<< "$RELEASE_PLAN_JSON")
+        [ "$PLAN_APPLICATION" == "$APPLICATION" ] ||
+          fail "ReleasePlan $RELEASE_PLAN is for application '$PLAN_APPLICATION', not '$APPLICATION'"
+        AUTO_RELEASE=$(jq -r '.metadata.labels["release.appstudio.openshift.io/auto-release"] // ""' \
+          <<< "$RELEASE_PLAN_JSON")
+        [ "$AUTO_RELEASE" == "false" ] ||
+          fail "ReleasePlan $RELEASE_PLAN must have label release.appstudio.openshift.io/auto-release: \"false\""
+
+        SELECTOR="${SNAPSHOT_UID_LABEL}=${SNAPSHOT_UID},${RELEASE_PLAN_LABEL}=${RELEASE_PLAN}"
+        EXISTING=$(kubectl get releases -n "$NAMESPACE" -l "$SELECTOR" -o json |
+          jq -r '.items[].metadata.name')
+        case $(grep -c . <<< "$EXISTING" || true) in
+          0)
+            RELEASE_NAME=$(jq -n \
+              --arg snapshot "$SNAPSHOT" --arg plan "$RELEASE_PLAN" --arg uid "$SNAPSHOT_UID" \
+              --arg uidLabel "$SNAPSHOT_UID_LABEL" --arg planLabel "$RELEASE_PLAN_LABEL" '{
+                apiVersion: "appstudio.redhat.com/v1alpha1",
+                kind: "Release",
+                metadata: {
+                  generateName: "pr-snapshot-",
+                  labels: {($uidLabel): $uid, ($planLabel): $plan}
+                },
+                spec: {snapshot: $snapshot, releasePlan: $plan}
+              }' | kubectl create -n "$NAMESPACE" -f - -o jsonpath='{.metadata.name}')
+            echo "Created Release $RELEASE_NAME for Snapshot $SNAPSHOT with ReleasePlan $RELEASE_PLAN"
+            ;;
+          1)
+            RELEASE_NAME=$EXISTING
+            echo "Reusing Release $RELEASE_NAME for Snapshot $SNAPSHOT with ReleasePlan $RELEASE_PLAN"
+            ;;
+          *)
+            fail "Found multiple Releases matching $SELECTOR: $(tr '\n' ' ' <<< "$EXISTING")"
+            ;;
+        esac
+        echo -n "$RELEASE_NAME" > "$(results.RELEASE_NAME.path)"
+
+        while true; do
+          CONDITION=$(kubectl get release "$RELEASE_NAME" -n "$NAMESPACE" -o json |
+            jq -c '[.status.conditions[]? | select(.type == "Released")][0] // {}')
+          STATUS=$(jq -r '.status // ""' <<< "$CONDITION")
+          REASON=$(jq -r '.reason // ""' <<< "$CONDITION")
+          if [ "$STATUS" == "True" ]; then
+            echo "Release $RELEASE_NAME succeeded"
+            exit 0
+          elif [ "$STATUS" == "False" ] && [ "$REASON" != "Progressing" ]; then
+            fail "Release $RELEASE_NAME failed ($REASON): $(jq -r '.message // ""' <<< "$CONDITION")"
+          fi
+
+          [ "$(date +%s)" -lt "$DEADLINE" ] ||
+            fail "Timed out after ${TIMEOUT_SECONDS}s waiting for Release $RELEASE_NAME"
+          echo "Release $RELEASE_NAME in progress (${REASON:-pending}), waiting..."
+          sleep 15
+        done
