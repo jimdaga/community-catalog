@@ -5,7 +5,7 @@ metadata:
   name: test-request-release-from-pr-snapshot-existing-release
 spec:
   description: |
-    Check that an existing Release for the Snapshot is reused instead of creating a new one
+    Check that the newest in-progress Release for the Snapshot is reused instead of creating a new one
   tasks:
     - name: run-task
       taskRef:

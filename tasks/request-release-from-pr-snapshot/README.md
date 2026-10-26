@@ -8,13 +8,17 @@ tenant ReleasePlan. The task itself holds no registry credentials; the
 ReleasePlan's pipeline and service account do the publishing.
 
 Guards:
-- The Snapshot must come from a pull_request event
+- The Snapshot must come from a pull request: it has the
+  pac.test.appstudio.openshift.io/pull-request annotation and is not from a push
+  event (the same check integration-service uses, so builds triggered by PR
+  comments such as /retest also qualify)
 - The ReleasePlan must belong to the same application as the Snapshot
 - The ReleasePlan must be labeled release.appstudio.openshift.io/auto-release: "false"
   so that it cannot be a ReleasePlan used for regular releases
 
-A Release already created for the same Snapshot UID and ReleasePlan is
-reused, so re-running the test does not create duplicate Releases.
+The newest Release already created for the same Snapshot UID and ReleasePlan
+is reused unless it failed, so re-running the test does not create duplicate
+Releases but does retry a failed one.
 The task succeeds or fails based on the Release's Released condition.
 
 The TaskRun service account needs get access to Snapshots and ReleasePlans

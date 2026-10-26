@@ -7,10 +7,11 @@ set -eu
 #
 # Snapshots:
 #   pr-snapshot           pull_request event, application demo
-#   pr-snapshot-existing  a Release already exists for it
+#   pr-snapshot-existing  an in-progress Release already exists for it
+#   pr-snapshot-retry     a failed Release already exists for it
 #   pr-snapshot-failed    its Release fails
 #   pr-snapshot-stuck     its Release never completes
-#   pr-snapshot-duplicate two Releases already exist for it
+#   retest-snapshot       pull request rebuilt by a /retest comment
 #   push-snapshot         push event
 #   other-app-snapshot    pull_request event, application other
 # ReleasePlans:
@@ -23,15 +24,18 @@ function sleep() {
 
 function kubectl() {
   if [[ "$1" == "get" && "$2" == "snapshot" ]]; then
+    PR_NUMBER=42
     case "$3" in
-      push-snapshot) EVENT=push; APP=demo ;;
+      push-snapshot) EVENT=push; APP=demo; PR_NUMBER="" ;;
+      retest-snapshot) EVENT=retest-all-comment; APP=demo ;;
       other-app-snapshot) EVENT=pull_request; APP=other ;;
       *) EVENT=pull_request; APP=demo ;;
     esac
-    jq -n --arg name "$3" --arg event "$EVENT" --arg app "$APP" '{
+    jq -n --arg name "$3" --arg event "$EVENT" --arg app "$APP" --arg pr "$PR_NUMBER" '{
       metadata: {
         name: $name, uid: ("uid-" + $name),
-        labels: {"pac.test.appstudio.openshift.io/event-type": $event}
+        labels: {"pac.test.appstudio.openshift.io/event-type": $event},
+        annotations: (if $pr == "" then {} else {"pac.test.appstudio.openshift.io/pull-request": $pr} end)
       },
       spec: {application: $app, components: []}
     }'
@@ -50,9 +54,19 @@ function kubectl() {
   elif [[ "$1" == "get" && "$2" == "releases" ]]; then
     case "$*" in
       *pr-snapshot-uid=uid-pr-snapshot-existing,*)
-        echo '{"items": [{"metadata": {"name": "release-pr-snapshot-existing"}}]}' ;;
-      *pr-snapshot-uid=uid-pr-snapshot-duplicate,*)
-        echo '{"items": [{"metadata": {"name": "release-a"}}, {"metadata": {"name": "release-b"}}]}' ;;
+        # The newest Release is still in progress, so it is reused
+        echo '{"items": [
+          {"metadata": {"name": "release-old", "creationTimestamp": "2026-01-01T00:00:00Z"},
+           "status": {"conditions": [{"type": "Released", "status": "False", "reason": "Failed"}]}},
+          {"metadata": {"name": "release-pr-snapshot-existing", "creationTimestamp": "2026-01-02T00:00:00Z"},
+           "status": {"conditions": [{"type": "Released", "status": "False", "reason": "Progressing"}]}}
+        ]}' ;;
+      *pr-snapshot-uid=uid-pr-snapshot-retry,*)
+        # The newest Release failed, so a new one is created
+        echo '{"items": [
+          {"metadata": {"name": "release-failed-before", "creationTimestamp": "2026-01-01T00:00:00Z"},
+           "status": {"conditions": [{"type": "Released", "status": "False", "reason": "Failed"}]}}
+        ]}' ;;
       *) echo '{"items": []}' ;;
     esac
 

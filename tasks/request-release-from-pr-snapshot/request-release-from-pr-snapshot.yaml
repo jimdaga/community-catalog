@@ -13,13 +13,17 @@ spec:
     ReleasePlan's pipeline and service account do the publishing.
 
     Guards:
-    - The Snapshot must come from a pull_request event
+    - The Snapshot must come from a pull request: it has the
+      pac.test.appstudio.openshift.io/pull-request annotation and is not from a push
+      event (the same check integration-service uses, so builds triggered by PR
+      comments such as /retest also qualify)
     - The ReleasePlan must belong to the same application as the Snapshot
     - The ReleasePlan must be labeled release.appstudio.openshift.io/auto-release: "false"
       so that it cannot be a ReleasePlan used for regular releases
 
-    A Release already created for the same Snapshot UID and ReleasePlan is
-    reused, so re-running the test does not create duplicate Releases.
+    The newest Release already created for the same Snapshot UID and ReleasePlan
+    is reused unless it failed, so re-running the test does not create duplicate
+    Releases but does retry a failed one.
     The task succeeds or fails based on the Release's Released condition.
 
     The TaskRun service account needs get access to Snapshots and ReleasePlans
@@ -70,8 +74,12 @@ spec:
         SNAPSHOT_JSON=$(kubectl get snapshot "$SNAPSHOT" -n "$NAMESPACE" -o json)
         EVENT_TYPE=$(jq -r '.metadata.labels["pac.test.appstudio.openshift.io/event-type"] // ""' \
           <<< "$SNAPSHOT_JSON")
-        [ "$EVENT_TYPE" == "pull_request" ] ||
-          fail "Snapshot $SNAPSHOT is not from a pull_request event (event-type: '$EVENT_TYPE')"
+        PULL_REQUEST=$(jq -r '.metadata.annotations["pac.test.appstudio.openshift.io/pull-request"] // ""' \
+          <<< "$SNAPSHOT_JSON")
+        if [ -z "$PULL_REQUEST" ] || [ "$EVENT_TYPE" == "push" ] || [ "$EVENT_TYPE" == "Push" ]; then
+          fail "Snapshot $SNAPSHOT is not from a pull request" \
+            "(event-type: '$EVENT_TYPE', pull-request: '$PULL_REQUEST')"
+        fi
         APPLICATION=$(jq -r '.spec.application' <<< "$SNAPSHOT_JSON")
         SNAPSHOT_UID=$(jq -r '.metadata.uid' <<< "$SNAPSHOT_JSON")
 
@@ -84,37 +92,46 @@ spec:
         [ "$AUTO_RELEASE" == "false" ] ||
           fail "ReleasePlan $RELEASE_PLAN must have label release.appstudio.openshift.io/auto-release: \"false\""
 
+        released_condition() {
+          jq -c '[.status.conditions[]? | select(.type == "Released")][0] // {}'
+        }
+
         SELECTOR="${SNAPSHOT_UID_LABEL}=${SNAPSHOT_UID},${RELEASE_PLAN_LABEL}=${RELEASE_PLAN}"
-        EXISTING=$(kubectl get releases -n "$NAMESPACE" -l "$SELECTOR" -o json |
-          jq -r '.items[].metadata.name')
-        case $(grep -c . <<< "$EXISTING" || true) in
-          0)
-            RELEASE_NAME=$(jq -n \
-              --arg snapshot "$SNAPSHOT" --arg plan "$RELEASE_PLAN" --arg uid "$SNAPSHOT_UID" \
-              --arg uidLabel "$SNAPSHOT_UID_LABEL" --arg planLabel "$RELEASE_PLAN_LABEL" '{
-                apiVersion: "appstudio.redhat.com/v1alpha1",
-                kind: "Release",
-                metadata: {
-                  generateName: "pr-snapshot-",
-                  labels: {($uidLabel): $uid, ($planLabel): $plan}
-                },
-                spec: {snapshot: $snapshot, releasePlan: $plan}
-              }' | kubectl create -n "$NAMESPACE" -f - -o jsonpath='{.metadata.name}')
-            echo "Created Release $RELEASE_NAME for Snapshot $SNAPSHOT with ReleasePlan $RELEASE_PLAN"
-            ;;
-          1)
-            RELEASE_NAME=$EXISTING
-            echo "Reusing Release $RELEASE_NAME for Snapshot $SNAPSHOT with ReleasePlan $RELEASE_PLAN"
-            ;;
-          *)
-            fail "Found multiple Releases matching $SELECTOR: $(tr '\n' ' ' <<< "$EXISTING")"
-            ;;
-        esac
+        LATEST=$(kubectl get releases -n "$NAMESPACE" -l "$SELECTOR" -o json |
+          jq -c '.items | sort_by(.metadata.creationTimestamp) | last // empty')
+        LATEST_FAILED=false
+        if [ -n "$LATEST" ]; then
+          LATEST_CONDITION=$(released_condition <<< "$LATEST")
+          if [ "$(jq -r '.status // ""' <<< "$LATEST_CONDITION")" == "False" ] &&
+            [ "$(jq -r '.reason // ""' <<< "$LATEST_CONDITION")" != "Progressing" ]; then
+            LATEST_FAILED=true
+          fi
+        fi
+
+        if [ -n "$LATEST" ] && [ "$LATEST_FAILED" == "false" ]; then
+          RELEASE_NAME=$(jq -r '.metadata.name' <<< "$LATEST")
+          echo "Reusing Release $RELEASE_NAME for Snapshot $SNAPSHOT with ReleasePlan $RELEASE_PLAN"
+        else
+          if [ "$LATEST_FAILED" == "true" ]; then
+            echo "Previous Release $(jq -r '.metadata.name' <<< "$LATEST") failed, creating a new one"
+          fi
+          RELEASE_NAME=$(jq -n \
+            --arg snapshot "$SNAPSHOT" --arg plan "$RELEASE_PLAN" --arg uid "$SNAPSHOT_UID" \
+            --arg uidLabel "$SNAPSHOT_UID_LABEL" --arg planLabel "$RELEASE_PLAN_LABEL" '{
+              apiVersion: "appstudio.redhat.com/v1alpha1",
+              kind: "Release",
+              metadata: {
+                generateName: "pr-snapshot-",
+                labels: {($uidLabel): $uid, ($planLabel): $plan}
+              },
+              spec: {snapshot: $snapshot, releasePlan: $plan}
+            }' | kubectl create -n "$NAMESPACE" -f - -o jsonpath='{.metadata.name}')
+          echo "Created Release $RELEASE_NAME for Snapshot $SNAPSHOT with ReleasePlan $RELEASE_PLAN"
+        fi
         echo -n "$RELEASE_NAME" > "$(results.RELEASE_NAME.path)"
 
         while true; do
-          CONDITION=$(kubectl get release "$RELEASE_NAME" -n "$NAMESPACE" -o json |
-            jq -c '[.status.conditions[]? | select(.type == "Released")][0] // {}')
+          CONDITION=$(kubectl get release "$RELEASE_NAME" -n "$NAMESPACE" -o json | released_condition)
           STATUS=$(jq -r '.status // ""' <<< "$CONDITION")
           REASON=$(jq -r '.reason // ""' <<< "$CONDITION")
           if [ "$STATUS" == "True" ]; then

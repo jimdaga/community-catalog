@@ -7,7 +7,7 @@ metadata:
     test/assert-task-failure: "run-task"
 spec:
   description: |
-    Check that the task fails for a Snapshot that is not from a pull_request event
+    Check that the task fails for a Snapshot from a push event
   tasks:
     - name: run-task
       taskRef:
