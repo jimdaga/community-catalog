@@ -12,6 +12,7 @@ set -eu
 #   pr-snapshot-failed    its Release fails
 #   pr-snapshot-stuck     its Release never completes
 #   retest-snapshot       pull request rebuilt by a /retest comment
+#   sha-mismatch-snapshot component revision differs from the PaC sha label
 #   push-snapshot         push event
 #   other-app-snapshot    pull_request event, application other
 # ReleasePlans:
@@ -25,19 +26,32 @@ function sleep() {
 function kubectl() {
   if [[ "$1" == "get" && "$2" == "snapshot" ]]; then
     PR_NUMBER=42
+    REVISION=abc123
     case "$3" in
+      sha-mismatch-snapshot) EVENT=pull_request; APP=demo; REVISION=def456 ;;
       push-snapshot) EVENT=push; APP=demo; PR_NUMBER="" ;;
       retest-snapshot) EVENT=retest-all-comment; APP=demo ;;
       other-app-snapshot) EVENT=pull_request; APP=other ;;
       *) EVENT=pull_request; APP=demo ;;
     esac
-    jq -n --arg name "$3" --arg event "$EVENT" --arg app "$APP" --arg pr "$PR_NUMBER" '{
+    jq -n --arg name "$3" --arg event "$EVENT" --arg app "$APP" --arg pr "$PR_NUMBER" \
+      --arg revision "$REVISION" '{
       metadata: {
         name: $name, uid: ("uid-" + $name),
-        labels: {"pac.test.appstudio.openshift.io/event-type": $event},
+        labels: {
+          "pac.test.appstudio.openshift.io/event-type": $event,
+          "pac.test.appstudio.openshift.io/sha": "abc123",
+          "appstudio.openshift.io/component": "demo-component"
+        },
         annotations: (if $pr == "" then {} else {"pac.test.appstudio.openshift.io/pull-request": $pr} end)
       },
-      spec: {application: $app, components: []}
+      spec: {
+        application: $app,
+        components: [
+          {name: "other-component", source: {git: {revision: "fff999"}}},
+          {name: "demo-component", source: {git: {revision: $revision}}}
+        ]
+      }
     }'
 
   elif [[ "$1" == "get" && "$2" == "releaseplan" ]]; then

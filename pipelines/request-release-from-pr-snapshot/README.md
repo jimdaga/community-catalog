@@ -4,7 +4,9 @@ Create a Release for a pull request Snapshot and wait for it to complete.
 
 Intended to be used as an IntegrationTestScenario pipeline so that pull
 request builds are published by a dedicated, non auto-release ReleasePlan.
-See the task README for the guards applied and the RBAC required
+The IntegrationTestScenario must be annotated with
+test.appstudio.openshift.io/snapshot-param-as-name: "true" so SNAPSHOT is the
+Snapshot name. See the task README for the guards applied and the RBAC required
 
 ## Parameters
 

@@ -7,11 +7,18 @@ can be published (for example to a development registry) by an existing
 tenant ReleasePlan. The task itself holds no registry credentials; the
 ReleasePlan's pipeline and service account do the publishing.
 
+The IntegrationTestScenario must be annotated with
+test.appstudio.openshift.io/snapshot-param-as-name: "true" so that the
+integration service passes the Snapshot name, not its serialized spec, as SNAPSHOT.
+
 Guards:
 - The Snapshot must come from a pull request: it has the
   pac.test.appstudio.openshift.io/pull-request annotation and is not from a push
   event (the same check integration-service uses, so builds triggered by PR
   comments such as /retest also qualify)
+- The git revision of the component that triggered the Snapshot must match the
+  pac.test.appstudio.openshift.io/sha label set by Pipelines as Code, so a PR
+  cannot publish images under another commit's SHA tag
 - The ReleasePlan must belong to the same application as the Snapshot
 - The ReleasePlan must be labeled release.appstudio.openshift.io/auto-release: "false"
   so that it cannot be a ReleasePlan used for regular releases

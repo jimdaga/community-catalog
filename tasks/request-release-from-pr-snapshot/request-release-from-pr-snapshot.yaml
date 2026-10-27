@@ -12,11 +12,18 @@ spec:
     tenant ReleasePlan. The task itself holds no registry credentials; the
     ReleasePlan's pipeline and service account do the publishing.
 
+    The IntegrationTestScenario must be annotated with
+    test.appstudio.openshift.io/snapshot-param-as-name: "true" so that the
+    integration service passes the Snapshot name, not its serialized spec, as SNAPSHOT.
+
     Guards:
     - The Snapshot must come from a pull request: it has the
       pac.test.appstudio.openshift.io/pull-request annotation and is not from a push
       event (the same check integration-service uses, so builds triggered by PR
       comments such as /retest also qualify)
+    - The git revision of the component that triggered the Snapshot must match the
+      pac.test.appstudio.openshift.io/sha label set by Pipelines as Code, so a PR
+      cannot publish images under another commit's SHA tag
     - The ReleasePlan must belong to the same application as the Snapshot
     - The ReleasePlan must be labeled release.appstudio.openshift.io/auto-release: "false"
       so that it cannot be a ReleasePlan used for regular releases
@@ -69,6 +76,11 @@ spec:
         [[ "$TIMEOUT_SECONDS" =~ ^[0-9]+$ ]] || fail "TIMEOUT_SECONDS must be a whole number"
         # The ReleasePlan name is stored as a label value, which is limited to 63 characters
         [ "${#RELEASE_PLAN}" -le 63 ] || fail "RELEASE_PLAN name must be 63 characters or fewer"
+        # Without the snapshot-param-as-name annotation on the IntegrationTestScenario,
+        # SNAPSHOT is the Snapshot's serialized spec instead of its name
+        [[ ${#SNAPSHOT} -le 253 && "$SNAPSHOT" =~ ^[a-z0-9]([a-z0-9.-]*[a-z0-9])?$ ]] ||
+          fail "SNAPSHOT is not a Snapshot name. Annotate the IntegrationTestScenario with" \
+            "test.appstudio.openshift.io/snapshot-param-as-name: \"true\""
         DEADLINE=$(( $(date +%s) + TIMEOUT_SECONDS ))
 
         SNAPSHOT_JSON=$(kubectl get snapshot "$SNAPSHOT" -n "$NAMESPACE" -o json)
@@ -79,6 +91,14 @@ spec:
         if [ -z "$PULL_REQUEST" ] || [ "$EVENT_TYPE" == "push" ] || [ "$EVENT_TYPE" == "Push" ]; then
           fail "Snapshot $SNAPSHOT is not from a pull request" \
             "(event-type: '$EVENT_TYPE', pull-request: '$PULL_REQUEST')"
+        fi
+        PAC_SHA=$(jq -r '.metadata.labels["pac.test.appstudio.openshift.io/sha"] // ""' <<< "$SNAPSHOT_JSON")
+        COMPONENT=$(jq -r '.metadata.labels["appstudio.openshift.io/component"] // ""' <<< "$SNAPSHOT_JSON")
+        REVISION=$(jq -r --arg component "$COMPONENT" \
+          '.spec.components[] | select(.name == $component) | .source.git.revision // ""' <<< "$SNAPSHOT_JSON")
+        if [ -z "$PAC_SHA" ] || [ "$REVISION" != "$PAC_SHA" ]; then
+          fail "Revision '$REVISION' of component '$COMPONENT' does not match the pull request" \
+            "commit '$PAC_SHA' from Pipelines as Code"
         fi
         APPLICATION=$(jq -r '.spec.application' <<< "$SNAPSHOT_JSON")
         SNAPSHOT_UID=$(jq -r '.metadata.uid' <<< "$SNAPSHOT_JSON")
